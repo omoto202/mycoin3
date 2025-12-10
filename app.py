@@ -137,7 +137,7 @@ def submit_chain():
         return jsonify({'error': 'invalid chain format'}), 400
     with blockchain_lock:
         if len(incoming) > len(chain) and is_valid_chain(incoming):
-            global chain
+            # global chain
             chain = incoming
             # When chain replaced, clear pending txs that are included
             pending_txs.clear()
