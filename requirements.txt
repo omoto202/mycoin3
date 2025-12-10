@@ -1,3 +1,2 @@
 Flask==2.3.2
-elliptic==0.0.4
 gunicorn==20.1.0
