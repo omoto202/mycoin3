@@ -1,265 +1,269 @@
-from flask import Flask, request, jsonify, render_template, Response
-import threading, time, json, hashlib, base64, datetime, queue
-from cryptography.hazmat.primitives import hashes, serialization
-from cryptography.hazmat.primitives.asymmetric import ec
-from cryptography.exceptions import InvalidSignature
+# app.py
+import json
+import time
+import threading
+import queue
+from hashlib import sha256
+from flask import Flask, request, jsonify, render_template, Response, stream_with_context
 
-# Configuration
-DIFFICULTY = 3  # leading hex zeros required
-START_REWARD = 50.0
-COIN_CAP = 21_000_000.0
+app = Flask(__name__)
 
-app = Flask(__name__, static_folder='static', template_folder='templates')
+# ==============
+# Blockchain model (simple, in-memory)
+# ==============
+MAX_SUPPLY = 21_000_000
+BASE_REWARD = 50
+DIFFICULTY = 3  # default
 
-# In-memory blockchain state
-blockchain_lock = threading.Lock()
-chain = []  # list of blocks
-pending_txs = []  # list of transactions (not yet mined)
+def now_iso():
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
 
-# SSE clients: a list of queues (one per connected client)
-sse_clients = []
+def hash_block(block_dict):
+    # deterministic serialization
+    block_string = json.dumps(block_dict, sort_keys=True, separators=(',', ':'))
+    return sha256(block_string.encode()).hexdigest()
 
-# Utility functions
-def sha256_hex(data: bytes) -> str:
-    return hashlib.sha256(data).hexdigest()
+class Blockchain:
+    def __init__(self, difficulty=DIFFICULTY):
+        self.chain = []
+        self.pending = []
+        self.difficulty = difficulty
+        self.total_issued = 0  # total coins issued via coinbase txs
+        # create genesis
+        if not self.chain:
+            genesis = {
+                "index": 0,
+                "timestamp": now_iso(),
+                "nonce": 0,
+                "previous_hash": "0" * 64,
+                "transactions": [],
+                "miner": None,
+            }
+            genesis["hash"] = hash_block(genesis)
+            self.chain.append(genesis)
 
-def serialize_block_for_hash(block):
-    # deterministic representation for hashing (exclude 'hash' field)
-    b = {
-        'index': block['index'],
-        'timestamp': block['timestamp'],
-        'nonce': block['nonce'],
-        'prev_hash': block['prev_hash'],
-        'transactions': block['transactions'],
-        'miner': block.get('miner', None)
-    }
-    return json.dumps(b, sort_keys=True, separators=(',', ':')).encode()
+    def last_block(self):
+        return self.chain[-1]
 
-def compute_block_hash(block):
-    return sha256_hex(serialize_block_for_hash(block))
+    def add_transaction(self, tx):
+        # tx should be dict: {sender_pub, recipient_pub, amount, signature, timestamp}
+        self.pending.append(tx)
 
-def is_valid_chain(c):
-    # Basic validation: chain continuity and block hashes & PoW
-    for i in range(1, len(c)):
-        prev = c[i-1]
-        blk = c[i]
-        if blk['prev_hash'] != prev['hash']:
-            return False
-        # validate hash
-        if compute_block_hash(blk) != blk['hash']:
-            return False
-        # validate PoW
-        if not blk['hash'].startswith('0' * DIFFICULTY):
-            return False
-        # (signature checks for transactions are done when tx accepted)
-    return True
+    def compute_balance(self, pubkey):
+        bal = 0.0
+        for b in self.chain:
+            for t in b.get("transactions", []):
+                # coinbase tx has sender = "SYSTEM"
+                sender = t.get("sender")
+                recipient = t.get("recipient")
+                amt = float(t.get("amount", 0))
+                if recipient == pubkey:
+                    bal += amt
+                if sender == pubkey:
+                    bal -= amt
+        # include pending outgoing (not yet mined) as negative
+        for t in self.pending:
+            if t.get("sender") == pubkey:
+                bal -= float(t.get("amount", 0))
+        return bal
 
-def total_issued(chain_obj):
-    total = 0.0
-    for blk in chain_obj:
-        for tx in blk.get('transactions', []):
-            if tx.get('from') == 'SYSTEM':
-                total += float(tx.get('amount', 0))
-    return total
+    def current_reward(self):
+        # determine halving count:
+        count = 0
+        # thresholds: when total_issued >= MAX*(1 - 1/2^n) => reward has halved n times
+        for n in range(1, 64):
+            threshold = MAX_SUPPLY * (1 - 1 / (2 ** n))
+            if self.total_issued >= threshold:
+                count = n
+            else:
+                break
+        reward = BASE_REWARD / (2 ** count)
+        # avoid fractional tiny reward - return float for UI
+        return float(reward)
 
-def current_reward(chain_obj):
-    issued = total_issued(chain_obj)
-    # Determine halving count k such that for k>=0:
-    # next halving threshold at COIN_CAP*(1 - 1/2^(k+1))
-    k = 0
-    while True:
-        threshold = COIN_CAP * (1.0 - 1.0 / (2 ** (k + 1)))
-        if issued >= threshold:
-            k += 1
-        else:
-            break
-    reward = START_REWARD / (2 ** k)
-    # enforce coin cap
-    if issued >= COIN_CAP:
-        return 0.0
-    if issued + reward > COIN_CAP:
-        return max(0.0, COIN_CAP - issued)
-    return reward
-
-def verify_signature(spki_b64, signature_b64, message_bytes):
-    try:
-        spki_der = base64.b64decode(spki_b64)
-        pubkey = serialization.load_der_public_key(spki_der)
-        signature = base64.b64decode(signature_b64)
-        pubkey.verify(signature, message_bytes, ec.ECDSA(hashes.SHA256()))
-        return True
-    except (ValueError, InvalidSignature, Exception):
-        return False
-
-def broadcast_event(event_name, data):
-    payload = f"event: {event_name}\n" + f"data: {json.dumps(data)}\n\n"
-    # push to client queues
-    remove = []
-    for q in sse_clients:
-        try:
-            q.put(payload, block=False)
-        except Exception:
-            remove.append(q)
-    for q in remove:
-        try:
-            sse_clients.remove(q)
-        except ValueError:
-            pass
-
-# Initialize genesis block
-with blockchain_lock:
-    genesis = {
-        'index': 0,
-        'timestamp': int(time.time()),
-        'nonce': 0,
-        'prev_hash': '0' * 64,
-        'transactions': [],
-        'miner': None
-    }
-    genesis['hash'] = compute_block_hash(genesis)
-    chain.append(genesis)
-
-# Flask routes
-@app.route('/')
-def index():
-    return render_template('index.html')
-
-@app.route('/get_chain', methods=['GET'])
-def get_chain():
-    with blockchain_lock:
-        return jsonify({'chain': chain, 'pending_txs': pending_txs})
-
-@app.route('/submit_chain', methods=['POST'])
-def submit_chain():
-    payload = request.get_json()
-    incoming = payload.get('chain')
-    if not isinstance(incoming, list):
-        return jsonify({'error': 'invalid chain format'}), 400
-    with blockchain_lock:
-        if len(incoming) > len(chain) and is_valid_chain(incoming):
-            # global chain
-            chain = incoming
-            # When chain replaced, clear pending txs that are included
-            pending_txs.clear()
-            broadcast_event('chain_replaced', {'chain_length': len(chain)})
-            return jsonify({'status': 'replaced', 'length': len(chain)})
-        else:
-            return jsonify({'status': 'rejected', 'reason': 'incoming not longer or invalid', 'current_length': len(chain)})
-
-@app.route('/submit_tx', methods=['POST'])
-def submit_tx():
-    tx = request.get_json()
-    required = ['from', 'to', 'amount', 'signature', 'pubkey_spki']
-    if not all(k in tx for k in required):
-        return jsonify({'error': 'missing tx fields'}), 400
-    # Validate signature
-    message = json.dumps({'from': tx['from'], 'to': tx['to'], 'amount': float(tx['amount'])}, sort_keys=True, separators=(',', ':')).encode()
-    if not verify_signature(tx['pubkey_spki'], tx['signature'], message):
-        return jsonify({'error': 'invalid signature'}), 400
-    # Verify that pubkey corresponds to 'from' (we expect 'from' to be base64 of pk or hex)
-    # For simplicity, we use pubkey_spki base64 as identity on server. Client should set tx['from'] to that same string.
-    if tx['from'] != tx['pubkey_spki']:
-        return jsonify({'error': 'from does not match pubkey'}), 400
-    # Check balance
-    with blockchain_lock:
-        bal = calculate_balance_internal(tx['from'])
-        if float(tx['amount']) > bal:
-            return jsonify({'error': 'insufficient funds', 'balance': bal}), 400
-        # append to pending
-        pending_txs.append({
-            'from': tx['from'],
-            'to': tx['to'],
-            'amount': float(tx['amount']),
-            'signature': tx['signature'],
-            'pubkey_spki': tx['pubkey_spki']
-        })
-    broadcast_event('new_tx', {'tx': pending_txs[-1]})
-    return jsonify({'status': 'accepted'})
-
-@app.route('/balance', methods=['GET'])
-def balance():
-    pub = request.args.get('pub')
-    if not pub:
-        return jsonify({'error': 'no pub provided'}), 400
-    with blockchain_lock:
-        bal = calculate_balance_internal(pub)
-    return jsonify({'balance': bal})
-
-def calculate_balance_internal(pub_spki_b64):
-    bal = 0.0
-    # scan blocks
-    for blk in chain:
-        for tx in blk.get('transactions', []):
-            if tx.get('to') == pub_spki_b64:
-                bal += float(tx.get('amount', 0))
-            if tx.get('from') == pub_spki_b64:
-                bal -= float(tx.get('amount', 0))
-    # pending txs: subtract outgoing pending
-    for tx in pending_txs:
-        if tx.get('from') == pub_spki_b64:
-            bal -= float(tx.get('amount', 0))
-    return bal
-
-@app.route('/mine', methods=['POST'])
-def mine():
-    data = request.get_json()
-    miner_pub = data.get('miner_pub')
-    if not miner_pub:
-        return jsonify({'error': 'miner_pub required'}), 400
-    with blockchain_lock:
-        reward = current_reward(chain)
-        # create coinbase tx
-        coinbase = {'from': 'SYSTEM', 'to': miner_pub, 'amount': float(reward)}
-        # bundle transactions (copy)
-        txs = [coinbase] + list(pending_txs)
-        # build block
-        new_block = {
-            'index': len(chain),
-            'timestamp': int(time.time()),
-            'nonce': 0,
-            'prev_hash': chain[-1]['hash'],
-            'transactions': txs,
-            'miner': miner_pub
+    def mine_block(self, miner_pubkey):
+        # coinbase tx:
+        reward = self.current_reward()
+        if self.total_issued + reward > MAX_SUPPLY:
+            # adjust reward or disallow if max reached
+            reward = max(0.0, MAX_SUPPLY - self.total_issued)
+        coinbase = {
+            "sender": "SYSTEM",
+            "recipient": miner_pubkey,
+            "amount": str(reward),
+            "signature": None,
+            "timestamp": now_iso()
         }
-        # PoW mining
-        target_prefix = '0' * DIFFICULTY
+
+        transactions = [coinbase] + list(self.pending)
+        index = len(self.chain)
+        previous_hash = self.last_block()["hash"]
         nonce = 0
-        found = False
+        target_prefix = "0" * self.difficulty
+
         while True:
-            new_block['nonce'] = nonce
-            h = compute_block_hash(new_block)
+            block = {
+                "index": index,
+                "timestamp": now_iso(),
+                "nonce": nonce,
+                "previous_hash": previous_hash,
+                "transactions": transactions,
+                "miner": miner_pubkey,
+            }
+            h = hash_block(block)
             if h.startswith(target_prefix):
-                new_block['hash'] = h
-                found = True
+                block["hash"] = h
                 break
             nonce += 1
-            # safety: avoid infinite loop in extremely constrained environments
-            # no sleep here to speed up mining; Render CPU limits can slow it.
-        if not found:
-            return jsonify({'error': 'mining failed'}), 500
+
         # append
-        chain.append(new_block)
-        # clear pending that were included (we included all)
-        pending_txs.clear()
-        broadcast_event('mined', {'block_index': new_block['index'], 'hash': new_block['hash'], 'miner': miner_pub, 'reward': reward})
-        return jsonify({'status': 'mined', 'block': new_block, 'reward': reward})
+        self.chain.append(block)
+        # update totals
+        self.total_issued += reward
+        # clear pending
+        self.pending = []
+        return block
 
-@app.route('/events')
-def events():
-    def gen(q):
+    def to_dict(self):
+        return {
+            "chain": self.chain,
+            "pending": self.pending,
+            "difficulty": self.difficulty,
+            "total_issued": self.total_issued,
+            "max_supply": MAX_SUPPLY,
+            "base_reward": BASE_REWARD
+        }
+
+    def replace_chain_if_longer(self, other_chain):
+        if not other_chain:
+            return False
+        if len(other_chain) > len(self.chain):
+            self.chain = other_chain
+            # recalc total_issued from chain
+            total = 0.0
+            for b in self.chain:
+                for t in b.get("transactions", []):
+                    if t.get("sender") == "SYSTEM":
+                        total += float(t.get("amount", 0))
+            self.total_issued = total
+            # reset pending (clients should resend pending txs if needed)
+            self.pending = []
+            return True
+        return False
+
+# instantiate
+blockchain = Blockchain()
+
+# SSE subscribers queue list
+subscribers = []
+
+sub_lock = threading.Lock()
+
+def broadcast_chain_update():
+    payload = json.dumps(blockchain.to_dict())
+    with sub_lock:
+        for q in list(subscribers):
+            try:
+                q.put(payload, block=False)
+            except Exception:
+                # drop broken subscribers
+                try:
+                    subscribers.remove(q)
+                except ValueError:
+                    pass
+
+# ==============
+# Flask routes
+# ==============
+
+@app.route("/")
+def index():
+    return render_template("index.html")
+
+@app.route("/api/chain", methods=["GET"])
+def api_chain():
+    return jsonify(blockchain.to_dict()), 200
+
+@app.route("/api/submit_tx", methods=["POST"])
+def api_submit_tx():
+    data = request.json
+    # expected fields: sender_pub, recipient_pub, amount, signature, timestamp
+    sender = data.get("sender")
+    recipient = data.get("recipient")
+    amount = float(data.get("amount", 0))
+    # signature and client-side signature verification assumed done client-side.
+    # server restricts by balance check:
+    if amount <= 0:
+        return jsonify({"ok": False, "error": "invalid amount"}), 400
+    bal = blockchain.compute_balance(sender)
+    if bal < amount - 1e-9:
+        return jsonify({"ok": False, "error": "insufficient balance", "balance": bal}), 400
+    # accept as pending tx
+    tx = {
+        "sender": sender,
+        "recipient": recipient,
+        "amount": str(amount),
+        "signature": data.get("signature"),
+        "timestamp": data.get("timestamp") or now_iso()
+    }
+    blockchain.add_transaction(tx)
+    # Optionally broadcast pending state (we broadcast chain updates only when mined)
+    return jsonify({"ok": True, "pending_count": len(blockchain.pending)}), 200
+
+@app.route("/api/sync_chain", methods=["POST"])
+def api_sync_chain():
+    data = request.json
+    other_chain = data.get("chain")
+    replaced = False
+    if other_chain and isinstance(other_chain, list):
+        replaced = blockchain.replace_chain_if_longer(other_chain)
+        if replaced:
+            # broadcast new chain to subscribers
+            broadcast_chain_update()
+            return jsonify({"ok": True, "replaced": True}), 200
+    # if not replaced, server may send its chain back for clients to adopt if server is longer
+    return jsonify({"ok": True, "replaced": False, "server_chain": blockchain.to_dict()}), 200
+
+@app.route("/api/mine", methods=["POST"])
+def api_mine():
+    data = request.json or {}
+    miner_pub = data.get("miner")
+    if not miner_pub:
+        return jsonify({"ok": False, "error": "miner public key required"}), 400
+    # server will mine (PoW)
+    block = blockchain.mine_block(miner_pub)
+    # broadcast
+    broadcast_chain_update()
+    return jsonify({"ok": True, "block": block, "chain_length": len(blockchain.chain)}), 200
+
+@app.route("/api/reset_pending", methods=["POST"])
+def api_reset_pending():
+    blockchain.pending = []
+    return jsonify({"ok": True}), 200
+
+@app.route("/stream")
+def stream():
+    def gen():
+        q = queue.Queue()
+        with sub_lock:
+            subscribers.append(q)
         try:
+            # initial send: current chain
+            init = json.dumps(blockchain.to_dict())
+            yield f"data: {init}\n\n"
             while True:
-                msg = q.get()
-                yield msg
+                payload = q.get()
+                yield f"data: {payload}\n\n"
         except GeneratorExit:
+            # client disconnected
             pass
+        finally:
+            with sub_lock:
+                try:
+                    subscribers.remove(q)
+                except ValueError:
+                    pass
+    return Response(stream_with_context(gen()), mimetype="text/event-stream")
 
-    q = queue.Queue()
-    sse_clients.append(q)
-    return Response(gen(q), mimetype='text/event-stream')
-
-if __name__ == '__main__':
-    # For Render, bind to 0.0.0.0 and default port
-    import os
-    port = int(os.environ.get('PORT', 5000))
-    app.run(host='0.0.0.0', port=port, threaded=True)
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=int(5000))
