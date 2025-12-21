@@ -14,7 +14,7 @@ DIFFICULTY = 3
 
 app = Flask(__name__)
 
-# SSE用のキュー（簡易的な実装のため、ワーカーは1つであることを前提とします）
+# SSE用のキュー
 message_queue = queue.Queue()
 
 # --- ブロックチェーンクラス ---
@@ -22,58 +22,56 @@ class Blockchain:
     def __init__(self):
         self.chain = []
         self.current_transactions = []
-        # ジェネシスブロック生成
-        self.new_block(previous_hash='1', proof=100)
+        # ジェネシスブロック生成 (No.0, Nonce=0, Prev=0)
+        self.new_block(previous_hash='0', proof=0)
 
     def new_block(self, proof, previous_hash=None):
         """
         ブロックチェーンに新しいブロックを作る
         """
         # 現在の総発行枚数を計算
-        current_supply = sum([sum([tx['amount'] for tx in block['transactions'] if tx['sender'] == '0']) for block in self.chain])
-        
-        # 報酬の計算 (半減期ロジック)
-        reward = MINING_REWARD_INITIAL
-        supply_threshold = MAX_COIN_SUPPLY / 2
-        temp_supply = current_supply
-        
-        # 単純化のため、現在の供給量が閾値を超えるたびに報酬を半分にする計算
-        # 実際のビットコインとは少し異なりますが、要件「半分のコインが発行されるたびに」に従います
-        limit = MAX_COIN_SUPPLY
-        check_reward = MINING_REWARD_INITIAL
-        
-        issued = 0
+        issued_amount = 0
         for b in self.chain:
             for tx in b['transactions']:
                 if tx['sender'] == '0':
-                    issued += tx['amount']
+                    issued_amount += tx['amount']
         
-        # 半減期判定
-        halving_count = 0
-        remaining = MAX_COIN_SUPPLY
-        threshold = remaining / 2
-        
-        # 累積的に計算
+        # 報酬の計算 (半減期ロジック)
+        reward = MINING_REWARD_INITIAL
         current_threshold = MAX_COIN_SUPPLY / 2
-        while issued >= current_threshold:
+        
+        # 簡易的な減衰計算
+        temp_issued = issued_amount
+        while temp_issued >= current_threshold:
             reward /= 2
             current_threshold += (MAX_COIN_SUPPLY - current_threshold) / 2
             if reward < 0.00000001: break
 
+        # 前のブロックのハッシュを決定
+        if previous_hash:
+            ph = previous_hash
+        elif self.chain:
+            ph = self.chain[-1]['hash']
+        else:
+            ph = '0'
+
         block = {
-            'index': len(self.chain) + 1,
+            'index': len(self.chain), # 0スタート
             'timestamp': datetime.now(timezone(timedelta(hours=9))).isoformat(), # JST
             'transactions': self.current_transactions,
             'proof': proof,
-            'previous_hash': previous_hash or self.hash(self.chain[-1]),
+            'previous_hash': ph,
             'reward_at_block': reward
         }
+
+        # 自身のハッシュを計算してブロックに含める
+        block['hash'] = self.hash(block)
 
         self.current_transactions = []
         self.chain.append(block)
         return block
 
-    def new_transaction(self, sender, recipient, amount, signature=None, public_key=None):
+    def new_transaction(self, sender, recipient, amount, signature=None):
         """
         新しいトランザクションをリストに加える
         """
@@ -85,14 +83,20 @@ class Blockchain:
             'timestamp': datetime.now(timezone(timedelta(hours=9))).isoformat()
         }
         self.current_transactions.append(transaction)
-        return self.last_block['index'] + 1
+        # 次のブロックのインデックスを返す
+        return len(self.chain)
 
     @staticmethod
     def hash(block):
         """
         ブロックのSHA-256ハッシュを作る
+        注意: ブロック辞書の中に既に 'hash' キーがある場合は除外して計算する
         """
-        block_string = json.dumps(block, sort_keys=True).encode()
+        block_copy = block.copy()
+        if 'hash' in block_copy:
+            del block_copy['hash']
+            
+        block_string = json.dumps(block_copy, sort_keys=True).encode()
         return hashlib.sha256(block_string).hexdigest()
 
     @property
@@ -101,8 +105,7 @@ class Blockchain:
 
     def proof_of_work(self, last_proof):
         """
-        シンプルなPoWアルゴリズム:
-        - hash(pp') の最初の3文字が0になるような p' を探す
+        シンプルなPoW: hash(pp')の先頭が000...となるp'を探す
         """
         proof = 0
         while self.valid_proof(last_proof, proof) is False:
@@ -113,27 +116,31 @@ class Blockchain:
     def valid_proof(last_proof, proof):
         guess = f'{last_proof}{proof}'.encode()
         guess_hash = hashlib.sha256(guess).hexdigest()
-        # Difficulty: 3
         return guess_hash[:DIFFICULTY] == "0" * DIFFICULTY
 
     def valid_chain(self, chain):
         """
-        チェーンが正当か確認する
+        チェーンの整合性を確認
         """
         last_block = chain[0]
         current_index = 1
 
+        # ジェネシスブロックのチェック (簡易)
+        if last_block['index'] != 0 or last_block['previous_hash'] != '0':
+            return False
+
         while current_index < len(chain):
             block = chain[current_index]
             
-            # ブロックのハッシュが正しいか
-            if block['previous_hash'] != self.hash(last_block):
+            # ブロックの previous_hash が前のブロックの hash と一致するか
+            if block['previous_hash'] != last_block['hash']:
                 return False
 
-            # PoWが正しいか
-            # 前のブロックのproofと現在のブロックのproofで検証
-            # 注: 簡易実装のため、proofの検証ロジックは上記のvalid_proofに依存
-            # 本来はブロックヘッダ全体をハッシュ化すべきですが、ここでは要件のPoWロジックに合わせます
+            # 前のブロックのハッシュ値自体が正しいか再計算チェック（改竄検知）
+            if self.hash(last_block) != last_block['hash']:
+                return False
+
+            # PoWのチェック
             if not self.valid_proof(last_block['proof'], block['proof']):
                 return False
 
@@ -151,7 +158,7 @@ class Blockchain:
                 if tx['sender'] == address:
                     balance -= tx['amount']
         
-        # 未承認トランザクションの考慮（二重支払い防止のため簡易チェック）
+        # 未承認トランザクションも考慮
         for tx in self.current_transactions:
             if tx['sender'] == address:
                 balance -= tx['amount']
@@ -174,17 +181,13 @@ def new_transaction():
     if not all(k in values for k in required):
         return 'Missing values', 400
 
-    # サーバー側での残高検証
-    if values['sender'] != '0': # システム報酬以外
+    if values['sender'] != '0':
         current_balance = blockchain.calculate_balance(values['sender'])
         if current_balance < float(values['amount']):
             return jsonify({'message': '残高不足です', 'status': 'fail'}), 400
 
-    # 署名検証（Python側でも簡易的に行うが、主はクライアントという要件）
-    # ここでは残高チェックを主とし、トランザクションを追加
     index = blockchain.new_transaction(values['sender'], values['recipient'], float(values['amount']), values['signature'])
-    
-    return jsonify({'message': f'トランザクションはブロック {index} に追加されます', 'status': 'success'}), 201
+    return jsonify({'message': f'トランザクションはブロック #{index} に追加されます', 'status': 'success'}), 201
 
 @app.route('/mine', methods=['POST'])
 def mine():
@@ -197,46 +200,36 @@ def mine():
     last_block = blockchain.last_block
     last_proof = last_block['proof']
     
-    # PoW計算 (サーバー負荷がかかるが、体験アプリとしてここで実行)
     proof = blockchain.proof_of_work(last_proof)
 
-    # 報酬トランザクション (sender="0" は報酬)
-    # 報酬額は new_block 内部で計算されるが、トランザクションとしてはここで追加する必要がある
-    # ここでは次期ブロックの報酬額を暫定計算してトランザクション作成
-    # ※厳密には new_block 内で報酬額が決まるため、少しロジックが循環するが、体験用に簡易化
-    
-    # 報酬額計算ロジックを再利用
-    # （本来はメソッド化すべきだが簡略化）
+    # 報酬計算（簡易）
     reward = MINING_REWARD_INITIAL
+    # 現在の発行済量から計算
     issued = 0
     for b in blockchain.chain:
         for tx in b['transactions']:
             if tx['sender'] == '0':
                 issued += tx['amount']
+    
     current_threshold = MAX_COIN_SUPPLY / 2
     while issued >= current_threshold:
         reward /= 2
         current_threshold += (MAX_COIN_SUPPLY - current_threshold) / 2
         if reward < 0.00000001: break
     
+    # 報酬トランザクション
     blockchain.new_transaction(
         sender="0",
         recipient=miner_address,
         amount=reward
     )
 
-    # ブロックをチェーンに追加
-    previous_hash = blockchain.hash(last_block)
-    block = blockchain.new_block(proof, previous_hash)
+    # ブロック生成
+    block = blockchain.new_block(proof)
 
-    # SSEで全クライアントに通知
     message_queue.put("new_block")
 
-    response = {
-        'message': '新しいブロックを採掘しました',
-        'block': block
-    }
-    return jsonify(response), 200
+    return jsonify({'message': 'マイニング成功', 'block': block}), 200
 
 @app.route('/chain', methods=['GET'])
 def full_chain():
@@ -248,30 +241,19 @@ def full_chain():
 
 @app.route('/nodes/resolve', methods=['POST'])
 def consensus():
-    """
-    クライアント（ローカルストレージ）とサーバーのチェーンを比較し、
-    長い方を採用する。サーバーがリセットされた場合、クライアントのチェーンを採用する。
-    """
     values = request.get_json()
     client_chain = values.get('chain')
 
     if not client_chain:
         return jsonify({'message': 'No chain provided', 'chain': blockchain.chain}), 400
 
-    # 長さ比較
     if len(client_chain) > len(blockchain.chain):
-        # クライアントの方が長い場合、サーバーを書き換え（検証は簡易的）
-        # 本来は valid_chain(client_chain) を通すべきだが、
-        # サーバーリセット後の復旧のため、形式があっていれば受け入れる実装にする
-        try:
-            blockchain.chain = client_chain
-            # 現在のトランザクションプールはクリアするか、整合性をとる必要があるが、ここではクリア
-            blockchain.current_transactions = []
-            message = 'サーバーのチェーンが更新されました（クライアント優先）'
-            new_chain = client_chain
-        except Exception as e:
-            message = 'チェーン更新エラー'
-            new_chain = blockchain.chain
+        # クライアントチェーンを採用
+        # 本来は検証が必要だがデモ用に受け入れる
+        blockchain.chain = client_chain
+        blockchain.current_transactions = [] # プールをリセット
+        message = 'サーバーのチェーンが更新されました'
+        new_chain = client_chain
     else:
         message = 'サーバーのチェーンが維持されました'
         new_chain = blockchain.chain
@@ -285,12 +267,10 @@ def get_balance():
     balance = blockchain.calculate_balance(address)
     return jsonify({'balance': balance}), 200
 
-# --- SSE (Server-Sent Events) ---
+# --- SSE ---
 def event_stream():
     while True:
-        # キューにメッセージが入るのを待つ
         msg = message_queue.get()
-        # データ形式: data: <payload>\n\n
         yield f"data: {msg}\n\n"
 
 @app.route('/events')
@@ -298,5 +278,4 @@ def sse():
     return Response(event_stream(), mimetype="text/event-stream")
 
 if __name__ == '__main__':
-    # ローカルテスト用
     app.run(host='0.0.0.0', port=5000)
