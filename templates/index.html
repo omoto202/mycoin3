@@ -28,12 +28,20 @@
             color: #ecf0f1;
             padding: 20px;
             border-radius: 5px;
-            overflow-x: auto;
+            overflow-x: hidden; /* 横スクロール防止 */
             white-space: pre-wrap; /* 改行を反映 */
+            word-break: break-all; /* 長い単語（ハッシュや鍵）を強制的に折り返す */
         }
-        .block-entry { margin-bottom: 5px; }
-        .block-separator { color: #95a5a6; margin: 15px 0; }
-        .tx-indent { margin-left: 20px; display: block; color: #bdc3c7; }
+        .block-separator { color: #95a5a6; margin: 20px 0; border-bottom: 1px dashed #7f8c8d; padding-bottom: 20px; }
+        
+        /* トランザクション表示用のスタイル */
+        .tx-block {
+            margin-left: 20px;
+            margin-bottom: 10px;
+            padding-left: 10px;
+            border-left: 2px solid #3498db; /* 左側に線を入れて視認性を上げる */
+        }
+        .tx-label { color: #bdc3c7; display: inline-block; width: 60px; }
     </style>
 </head>
 <body>
@@ -257,7 +265,7 @@
         };
     }
 
-    // --- 表示フォーマットの変更 ---
+    // --- 表示フォーマットの変更（公開鍵フル表示対応） ---
     function renderChain(chain) {
         const container = document.getElementById('chain-container');
         if (!chain || chain.length === 0) {
@@ -268,7 +276,7 @@
         let output = "";
 
         chain.forEach((block, index) => {
-            // 日付フォーマット変換 (ISO -> YYYY/MM/DD HH:mm:ss)
+            // 日付フォーマット変換
             let dateStr = "";
             try {
                 const date = new Date(block.timestamp);
@@ -292,12 +300,20 @@
 
             if (block.transactions && block.transactions.length > 0) {
                 block.transactions.forEach(tx => {
-                    let sender = tx.sender === "0" ? "SYSTEM(Reward)" : tx.sender.substring(0, 15) + "...";
-                    let recipient = tx.recipient.substring(0, 15) + "...";
-                    output += `<span class="tx-indent">From: ${sender}, To: ${recipient}, Amount: ${tx.amount}</span>\n`;
+                    // 送信者（システム報酬の場合は特別な表記、それ以外は生の公開鍵）
+                    let sender = tx.sender === "0" ? "SYSTEM (REWARD)" : tx.sender;
+                    let recipient = tx.recipient;
+                    
+                    // HTML構造を使ってインデントとフル表示を実現
+                    // CSSの .tx-block で左側の線とインデントを制御
+                    output += `<div class="tx-block">`;
+                    output += `   <span class="tx-label">From:</span>   ${sender}\n`;
+                    output += `   <span class="tx-label">To:</span>     ${recipient}\n`;
+                    output += `   <span class="tx-label">Amount:</span> ${tx.amount}\n`;
+                    output += `</div>`;
                 });
             } else {
-                output += `<span class="tx-indent">(なし)</span>\n`;
+                output += `   (なし)\n`;
             }
 
             // 最後のブロック以外には区切り線を入れる
