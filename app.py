@@ -7,22 +7,22 @@ from uuid import uuid4
 from ecdsa import VerifyingKey, SECP256k1, BadSignatureError
 import queue
 
-# --- 設定 ---
+#設定
 MINING_REWARD_INITIAL = 50
 MAX_COIN_SUPPLY = 21000000
 DIFFICULTY = 3
 
 app = Flask(__name__)
 
-# SSE用のキュー
+#SSE用
 message_queue = queue.Queue()
 
-# --- ブロックチェーンクラス ---
+#ブロックチェーンクラス
 class Blockchain:
     def __init__(self):
         self.chain = []
         self.current_transactions = []
-        # ジェネシスブロック生成 (No.0, Nonce=0, Prev=0)
+        #ジェネシスブロック生成
         self.new_block(previous_hash='0', proof=0)
 
     def new_block(self, proof, previous_hash=None):
